@@ -4,11 +4,10 @@
 ncurses file manager for Linux machines talking to a DOS host running the
 `rmtdos-cga-web` TSR.
 
-The DOS-side TSR is built and released by the companion
-[`rmtdos-cga-web`](https://github.com/l00nix/rmtdos-cga-web) project. For full
-remote directory and file-operation support, use `cgaweb.com` from
-[`rmtdos-cga-web v0.5.1`](https://github.com/l00nix/rmtdos-cga-web/releases/tag/v0.5.1)
-or newer.
+The DOS-side TSR is built by the companion
+[`tools/cga-web`](../cga-web/README.md) project. For full remote directory and
+file-operation support, use `cgaweb.com` from the `rmtdos-cga-web v0.5.1`
+lineage or newer.
 
 It starts with the same rmtdos LAN host discovery flow as `rmtdos-cga-web-client`,
 then opens a dual-pane file commander with remote DOS on the left and local Linux
@@ -112,10 +111,11 @@ printed before returning to the commander UI.
 
 ## Relationship to rmtdos-cga-web
 
-This is a new standalone project, not a fork. It reuses the Linux-side raw
-Ethernet, host discovery, and file-transfer protocol ideas from
-[`rmtdos-cga-web`](https://github.com/l00nix/rmtdos-cga-web), and is licensed
-GPL-2.0-or-later to remain compatible with that foundation.
+This started as a standalone project, not a fork. Inside `rmtdos-utils`, it
+lives beside the DOS TSR and Linux client under
+[`tools/cga-web`](../cga-web/README.md). It reuses the Linux-side raw Ethernet,
+host discovery, and file-transfer protocol ideas from that foundation, and is
+licensed GPL-2.0-or-later to remain compatible with it.
 
 See [docs/protocol-roadmap.md](docs/protocol-roadmap.md) for the proposed next
 TSR protocol features.
