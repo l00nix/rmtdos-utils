@@ -1,0 +1,1695 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#include "ui/commander.h"
+
+#include <arpa/inet.h>
+#include <ctype.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <ncurses.h>
+#include <net/ethernet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include "common/protocol.h"
+#include "net/file_transfer.h"
+#include "net/hostlist.h"
+#include "net/raw_socket.h"
+#include "net/remote_dir.h"
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+#ifndef NAME_MAX
+#define NAME_MAX 255
+#endif
+
+#define MAX_LOCAL_ENTRIES 512
+#define STATUS_LEN 160
+
+enum FocusPane {
+  FOCUS_REMOTE = 0,
+  FOCUS_LOCAL = 1,
+};
+
+struct LocalEntry {
+  char name[NAME_MAX + 1];
+  off_t size;
+  mode_t mode;
+  int is_dir;
+};
+
+struct LocalPanel {
+  char cwd[PATH_MAX];
+  struct LocalEntry entries[MAX_LOCAL_ENTRIES];
+  int count;
+  int selected;
+  int scroll;
+};
+
+struct RemotePanel {
+  struct RemoteDirEntry entries[REMOTE_DIR_MAX_ENTRIES];
+  int count;
+  int selected;
+  int scroll;
+  int loaded;
+};
+
+struct AppState {
+  struct RawSocket sock;
+  struct RemoteHost *active_host;
+  struct LocalPanel local;
+  struct RemotePanel remote;
+  enum FocusPane focus;
+  char remote_path[RMTDOS_PATH_BYTES];
+  char status[STATUS_LEN];
+  int running;
+};
+
+static void set_status(struct AppState *app, const char *fmt, ...) {
+  va_list ap;
+
+  va_start(ap, fmt);
+  vsnprintf(app->status, sizeof(app->status), fmt, ap);
+  va_end(ap);
+}
+
+static int is_exit_key(int ch) { return ch == 'q' || ch == 27 || ch == 29; }
+
+static int join_path(char *out, size_t out_len, const char *dir,
+                     const char *name) {
+  int n = snprintf(out, out_len, "%s/%s", dir, name);
+  return n < 0 || (size_t)n >= out_len ? -1 : 0;
+}
+
+static int local_entry_cmp(const void *lhs, const void *rhs) {
+  const struct LocalEntry *a = lhs;
+  const struct LocalEntry *b = rhs;
+
+  if (!strcmp(a->name, "..")) {
+    return -1;
+  }
+  if (!strcmp(b->name, "..")) {
+    return 1;
+  }
+  if (a->is_dir != b->is_dir) {
+    return b->is_dir - a->is_dir;
+  }
+  return strcasecmp(a->name, b->name);
+}
+
+static int local_panel_load(struct LocalPanel *panel, const char *path) {
+  DIR *dir;
+  struct dirent *de;
+  char resolved[PATH_MAX];
+
+  if (!realpath(path, resolved)) {
+    return -1;
+  }
+
+  dir = opendir(resolved);
+  if (!dir) {
+    return -1;
+  }
+
+  snprintf(panel->cwd, sizeof(panel->cwd), "%s", resolved);
+  panel->count = 0;
+  panel->selected = 0;
+  panel->scroll = 0;
+
+  if (strcmp(panel->cwd, "/") && panel->count < MAX_LOCAL_ENTRIES) {
+    struct LocalEntry *entry = &panel->entries[panel->count++];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->name, sizeof(entry->name), "..");
+    entry->is_dir = 1;
+    entry->mode = S_IFDIR;
+  }
+
+  while ((de = readdir(dir)) && panel->count < MAX_LOCAL_ENTRIES) {
+    struct LocalEntry *entry;
+    char full[PATH_MAX];
+    struct stat st;
+
+    if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) {
+      continue;
+    }
+
+    entry = &panel->entries[panel->count];
+    memset(entry, 0, sizeof(*entry));
+    snprintf(entry->name, sizeof(entry->name), "%s", de->d_name);
+    if (join_path(full, sizeof(full), panel->cwd, de->d_name)) {
+      continue;
+    }
+
+    if (!lstat(full, &st)) {
+      entry->size = st.st_size;
+      entry->mode = st.st_mode;
+      entry->is_dir = S_ISDIR(st.st_mode);
+    }
+
+    ++panel->count;
+  }
+
+  closedir(dir);
+  qsort(panel->entries, panel->count, sizeof(panel->entries[0]),
+        local_entry_cmp);
+  return 0;
+}
+
+static void local_panel_enter(struct AppState *app) {
+  struct LocalEntry *entry;
+  char next[PATH_MAX];
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  if (!entry->is_dir) {
+    set_status(app, "Local file selected: %s", entry->name);
+    return;
+  }
+
+  if (join_path(next, sizeof(next), app->local.cwd, entry->name)) {
+    set_status(app, "Path is too long.");
+    return;
+  }
+  if (local_panel_load(&app->local, next)) {
+    set_status(app, "Cannot enter %s: %s", entry->name, strerror(errno));
+  } else {
+    set_status(app, "Local: %s", app->local.cwd);
+  }
+}
+
+static int remote_path_join(char *out, size_t out_len, const char *dir,
+                            const char *name) {
+  size_t len;
+  int n;
+
+  if (!strcmp(name, ".") || !name[0]) {
+    n = snprintf(out, out_len, "%s", dir);
+  } else if (!strcmp(name, "..")) {
+    char tmp[RMTDOS_PATH_BYTES];
+    char *slash;
+
+    snprintf(tmp, sizeof(tmp), "%s", dir);
+    len = strlen(tmp);
+    if (len > 3 && tmp[len - 1] == '\\') {
+      tmp[len - 1] = '\0';
+    }
+    slash = strrchr(tmp, '\\');
+    if (slash && slash > tmp + 2) {
+      slash[0] = '\0';
+    } else if (slash) {
+      slash[1] = '\0';
+    }
+    n = snprintf(out, out_len, "%s", tmp);
+  } else {
+    len = strlen(dir);
+    n = snprintf(out, out_len, "%s%s%s", dir,
+                 len && dir[len - 1] == '\\' ? "" : "\\", name);
+  }
+
+  return n < 0 || (size_t)n >= out_len ? -1 : 0;
+}
+
+static int remote_name_exists(const struct RemotePanel *panel,
+                              const char *name) {
+  int i;
+
+  if (!panel->loaded) {
+    return 0;
+  }
+
+  for (i = 0; i < panel->count; ++i) {
+    if (!strcasecmp(panel->entries[i].name, name)) {
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int remote_panel_load(struct AppState *app) {
+  if (remote_dir_fetch(&app->sock, app->active_host->if_addr, app->remote_path,
+                       app->remote.entries, REMOTE_DIR_MAX_ENTRIES,
+                       &app->remote.count)) {
+    app->remote.loaded = 0;
+    set_status(app, "Remote listing failed for %s", app->remote_path);
+    return -1;
+  }
+
+  app->remote.selected = 0;
+  app->remote.scroll = 0;
+  app->remote.loaded = 1;
+  set_status(app, "Remote: %s", app->remote_path);
+  return 0;
+}
+
+static void remote_panel_enter(struct AppState *app) {
+  struct RemoteDirEntry *entry;
+  char next[RMTDOS_PATH_BYTES];
+
+  if (!app->remote.loaded || app->remote.count <= 0) {
+    set_status(app, "Remote directory is empty or not loaded.");
+    return;
+  }
+
+  entry = &app->remote.entries[app->remote.selected];
+  if (!entry->is_dir) {
+    set_status(app, "Remote file selected: %s", entry->name);
+    return;
+  }
+
+  if (remote_path_join(next, sizeof(next), app->remote_path, entry->name)) {
+    set_status(app, "Remote path is too long.");
+    return;
+  }
+
+  snprintf(app->remote_path, sizeof(app->remote_path), "%s", next);
+  remote_panel_load(app);
+}
+
+static void draw_status_bar(struct AppState *app) {
+  int rows;
+  int cols;
+
+  getmaxyx(stdscr, rows, cols);
+  attron(COLOR_PAIR(3));
+  mvhline(rows - 2, 0, ' ', cols);
+  mvprintw(rows - 2, 1, "%.*s", cols - 2, app->status);
+  mvhline(rows - 1, 0, ' ', cols);
+  mvprintw(rows - 1, 1,
+           "Tab  F2 Upload  F3 View  F4 Edit  F5 Copy  F6 Move  F7 Mkdir  F8 Delete  F9 Download  F10 Quit");
+  attroff(COLOR_PAIR(3));
+}
+
+static void draw_box_title(WINDOW *win, const char *title, int focused) {
+  if (focused) {
+    wattron(win, COLOR_PAIR(2) | A_BOLD);
+  }
+  box(win, 0, 0);
+  mvwprintw(win, 0, 2, " %s ", title);
+  if (focused) {
+    wattroff(win, COLOR_PAIR(2) | A_BOLD);
+  }
+}
+
+static void draw_remote_panel(struct AppState *app, WINDOW *win) {
+  char mac[MAC_ADDR_FMT_LEN];
+  int rows;
+  int cols;
+  int list_rows;
+  int i;
+
+  getmaxyx(win, rows, cols);
+  list_rows = rows - 4;
+  draw_box_title(win, "Remote DOS", app->focus == FOCUS_REMOTE);
+
+  mvwprintw(win, 1, 2, "Host: %s",
+            fmt_mac_addr(mac, sizeof(mac), app->active_host->if_addr));
+  mvwprintw(win, 2, 2, "%.*s", cols - 4, app->remote_path);
+
+  wattron(win, A_BOLD);
+  mvwprintw(win, 3, 2, "%-*s %10s", cols - 16, "Name", "Size");
+  wattroff(win, A_BOLD);
+
+  if (!app->remote.loaded) {
+    wattron(win, A_DIM);
+    mvwprintw(win, 5, 2, "Remote listing not loaded.");
+    wattroff(win, A_DIM);
+    return;
+  }
+
+  if (app->remote.selected < app->remote.scroll) {
+    app->remote.scroll = app->remote.selected;
+  } else if (app->remote.selected >= app->remote.scroll + list_rows) {
+    app->remote.scroll = app->remote.selected - list_rows + 1;
+  }
+
+  for (i = 0; i < list_rows && app->remote.scroll + i < app->remote.count;
+       ++i) {
+    int idx = app->remote.scroll + i;
+    struct RemoteDirEntry *entry = &app->remote.entries[idx];
+    int y = 4 + i;
+    char display[RMTDOS_DIR_ENTRY_NAME_BYTES + 4];
+
+    snprintf(display, sizeof(display), "%s%s", entry->name,
+             entry->is_dir ? "\\" : "");
+
+    if (idx == app->remote.selected && app->focus == FOCUS_REMOTE) {
+      wattron(win, COLOR_PAIR(1));
+    }
+
+    mvwprintw(win, y, 2, "%-*.*s", cols - 16, cols - 16, display);
+    if (!entry->is_dir) {
+      mvwprintw(win, y, cols - 13, "%10lu", (unsigned long)entry->size);
+    } else {
+      mvwprintw(win, y, cols - 13, "%10s", "<DIR>");
+    }
+
+    if (idx == app->remote.selected && app->focus == FOCUS_REMOTE) {
+      wattroff(win, COLOR_PAIR(1));
+    }
+  }
+}
+
+static void draw_local_panel(struct AppState *app, WINDOW *win) {
+  struct LocalPanel *panel = &app->local;
+  int rows;
+  int cols;
+  int list_rows;
+  int i;
+
+  getmaxyx(win, rows, cols);
+  list_rows = rows - 4;
+  draw_box_title(win, "Local Linux", app->focus == FOCUS_LOCAL);
+  mvwprintw(win, 1, 2, "%.*s", cols - 4, panel->cwd);
+
+  wattron(win, A_BOLD);
+  mvwprintw(win, 2, 2, "%-*s %10s", cols - 16, "Name", "Size");
+  wattroff(win, A_BOLD);
+
+  if (panel->selected < panel->scroll) {
+    panel->scroll = panel->selected;
+  } else if (panel->selected >= panel->scroll + list_rows) {
+    panel->scroll = panel->selected - list_rows + 1;
+  }
+
+  for (i = 0; i < list_rows && panel->scroll + i < panel->count; ++i) {
+    int idx = panel->scroll + i;
+    struct LocalEntry *entry = &panel->entries[idx];
+    int y = 3 + i;
+    char display[NAME_MAX + 4];
+
+    snprintf(display, sizeof(display), "%s%s", entry->name,
+             entry->is_dir ? "/" : "");
+
+    if (idx == panel->selected && app->focus == FOCUS_LOCAL) {
+      wattron(win, COLOR_PAIR(1));
+    }
+
+    mvwprintw(win, y, 2, "%-*.*s", cols - 16, cols - 16, display);
+    if (!entry->is_dir) {
+      mvwprintw(win, y, cols - 13, "%10ld", (long)entry->size);
+    } else {
+      mvwprintw(win, y, cols - 13, "%10s", "<DIR>");
+    }
+
+    if (idx == panel->selected && app->focus == FOCUS_LOCAL) {
+      wattroff(win, COLOR_PAIR(1));
+    }
+  }
+}
+
+static void draw_commander(struct AppState *app) {
+  int rows;
+  int cols;
+  int pane_h;
+  int left_w;
+  WINDOW *left;
+  WINDOW *right;
+
+  erase();
+  getmaxyx(stdscr, rows, cols);
+  pane_h = rows - 2;
+  left_w = cols / 2;
+
+  left = newwin(pane_h, left_w, 0, 0);
+  right = newwin(pane_h, cols - left_w, 0, left_w);
+
+  draw_remote_panel(app, left);
+  draw_local_panel(app, right);
+  draw_status_bar(app);
+
+  wnoutrefresh(stdscr);
+  wnoutrefresh(left);
+  wnoutrefresh(right);
+  doupdate();
+
+  delwin(left);
+  delwin(right);
+}
+
+static void process_incoming_packet(struct AppState *app) {
+  uint8_t buf[ETH_FRAME_LEN];
+  ssize_t received;
+  const struct ether_header *eh;
+  const struct ProtocolHeader *ph;
+
+  received = recv(app->sock.sock_fd, buf, sizeof(buf), 0);
+  if (received < (ssize_t)(sizeof(*eh) + sizeof(*ph))) {
+    return;
+  }
+
+  eh = (const struct ether_header *)buf;
+  ph = (const struct ProtocolHeader *)(eh + 1);
+
+  if (memcmp(eh->ether_dhost, app->sock.if_addr, ETH_ALEN) ||
+      ntohl(ph->signature) != PACKET_SIGNATURE ||
+      ntohl(ph->session_id) != app->sock.session_id) {
+    return;
+  }
+
+  if (ntohs(ph->pkt_type) == V1_STATUS_RESP) {
+    hostlist_register(buf, received);
+  }
+}
+
+static int socket_has_data(int fd, int timeout_ms) {
+  fd_set fds;
+  struct timeval tv;
+
+  FD_ZERO(&fds);
+  FD_SET(fd, &fds);
+  tv.tv_sec = timeout_ms / 1000;
+  tv.tv_usec = (timeout_ms % 1000) * 1000;
+  return select(fd + 1, &fds, NULL, NULL, &tv) > 0;
+}
+
+static void draw_selector(struct AppState *app) {
+  int rows;
+  int cols;
+  int y = 1;
+  int iter = 0;
+  struct RemoteHost *host;
+  struct timeval now;
+
+  erase();
+  getmaxyx(stdscr, rows, cols);
+  box(stdscr, 0, 0);
+  mvprintw(0, 2, " rmtdos LAN server selector ");
+  mvprintw(y++, 2, "%s", RMTDOS_FC_VERSION);
+  mvprintw(y++, 2, "Interface: %s  EtherType: %04x", app->sock.if_name,
+           app->sock.ethertype);
+  y++;
+
+  attron(COLOR_PAIR(2) | A_BOLD);
+  mvprintw(y++, 2, "Id  MAC address        Mode   Size    Last seen");
+  attroff(COLOR_PAIR(2) | A_BOLD);
+
+  gettimeofday(&now, NULL);
+  while ((host = hostlist_iter(&iter)) && y < rows - 3) {
+    struct timeval diff;
+    char mac[MAC_ADDR_FMT_LEN];
+
+    timersub(&now, &host->tv_last_resp, &diff);
+    mvprintw(y++, 2, "%2d  %s  %4d   %3dx%-3d %ld.%03lds", host->index,
+             fmt_mac_addr(mac, sizeof(mac), host->if_addr),
+             host->status.video_mode, host->status.text_cols,
+             host->status.text_rows, diff.tv_sec, diff.tv_usec / 1000);
+  }
+
+  mvprintw(rows - 2, 2, "Press 0-9 to select. q/Esc/Ctrl-] exits.");
+  refresh();
+  (void)cols;
+}
+
+static struct RemoteHost *run_selector(struct AppState *app) {
+  struct timeval last_probe = {0};
+
+  set_status(app, "Probing for rmtdos servers...");
+
+  while (app->running) {
+    struct timeval now;
+    struct timeval diff;
+    int ch;
+
+    gettimeofday(&now, NULL);
+    timersub(&now, &last_probe, &diff);
+    if (!timerisset(&last_probe) || diff.tv_sec >= 2) {
+      send_status_req(&app->sock, NULL);
+      last_probe = now;
+    }
+
+    while (socket_has_data(app->sock.sock_fd, 20)) {
+      process_incoming_packet(app);
+    }
+
+    draw_selector(app);
+
+    ch = getch();
+    if (ch == ERR) {
+      continue;
+    }
+    if (is_exit_key(ch)) {
+      app->running = 0;
+      return NULL;
+    }
+    if (ch >= '0' && ch <= '9') {
+      struct RemoteHost *host = hostlist_find_by_index(ch - '0');
+      if (host) {
+        return host;
+      }
+    }
+  }
+
+  return NULL;
+}
+
+static void shell_transfer_pause(void) {
+  printf("\nPress Enter to return to rmtdos-file-commander...");
+  fflush(stdout);
+  while (getchar() != '\n') {
+  }
+}
+
+static void remove_temp_edit(const char *tmp_path, const char *tmp_dir) {
+  if (tmp_path && tmp_path[0]) {
+    unlink(tmp_path);
+  }
+  if (tmp_dir && tmp_dir[0]) {
+    rmdir(tmp_dir);
+  }
+}
+
+static void ui_reset(void) {
+  clear();
+  refresh();
+}
+
+static const char *editor_name(void) {
+  const char *editor = getenv("VISUAL");
+  if (!editor || !editor[0]) {
+    editor = getenv("EDITOR");
+  }
+  return editor && editor[0] ? editor : "nano";
+}
+
+static const char *pager_name(void) {
+  const char *pager = getenv("PAGER");
+  return pager && pager[0] ? pager : "less";
+}
+
+static int run_editor_shell(const char *path) {
+  const char *editor = editor_name();
+  pid_t pid = fork();
+  int status;
+
+  if (pid < 0) {
+    perror("fork");
+    return -1;
+  }
+
+  if (pid == 0) {
+    execlp(editor, editor, path, (char *)NULL);
+    perror(editor);
+    _exit(127);
+  }
+
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("waitpid");
+    return -1;
+  }
+
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int run_pager_shell(const char *path) {
+  const char *pager = pager_name();
+  pid_t pid = fork();
+  int status;
+
+  if (pid < 0) {
+    perror("fork");
+    return -1;
+  }
+
+  if (pid == 0) {
+    execlp(pager, pager, path, (char *)NULL);
+    execlp("more", "more", path, (char *)NULL);
+    perror(pager);
+    _exit(127);
+  }
+
+  if (waitpid(pid, &status, 0) < 0) {
+    perror("waitpid");
+    return -1;
+  }
+
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
+static int file_fingerprint(const char *path, unsigned long *hash,
+                            off_t *size) {
+  FILE *fp;
+  unsigned char buf[4096];
+  size_t n;
+  struct stat st;
+  unsigned long h = 5381;
+
+  if (stat(path, &st)) {
+    return -1;
+  }
+
+  fp = fopen(path, "rb");
+  if (!fp) {
+    return -1;
+  }
+
+  while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+    size_t i;
+    for (i = 0; i < n; ++i) {
+      h = ((h << 5) + h) ^ buf[i];
+    }
+  }
+
+  if (ferror(fp)) {
+    fclose(fp);
+    return -1;
+  }
+
+  fclose(fp);
+  *hash = h;
+  *size = st.st_size;
+  return 0;
+}
+
+static int shell_prompt_upload_choice(const char *remote_path,
+                                      const char *tmp_path) {
+  int ch;
+
+  printf("\nModified remote file: %s\n", remote_path);
+  printf("Temp copy: %s\n", tmp_path);
+  printf("Upload changes back to DOS? [y/N] ");
+  fflush(stdout);
+  ch = getchar();
+  while (ch != '\n' && getchar() != '\n') {
+  }
+  return ch == 'y' || ch == 'Y';
+}
+
+static void safe_temp_name(char *dest, size_t dest_len, const char *name) {
+  size_t i;
+
+  for (i = 0; name[i] && i + 1 < dest_len; ++i) {
+    unsigned char ch = (unsigned char)name[i];
+    if (isalnum(ch) || ch == '.' || ch == '_' || ch == '-') {
+      dest[i] = name[i];
+    } else {
+      dest[i] = '_';
+    }
+  }
+  dest[i] = '\0';
+
+  if (!dest[0]) {
+    snprintf(dest, dest_len, "REMOTE.TXT");
+  }
+}
+
+static int prompt_text(const char *label, char *buf, size_t len) {
+  char *input;
+  char *original;
+  int label_col;
+  int rc;
+
+  input = calloc(len, 1);
+  original = calloc(len, 1);
+  if (!input || !original) {
+    free(input);
+    free(original);
+    return -1;
+  }
+
+  snprintf(original, len, "%s", buf);
+
+  nodelay(stdscr, FALSE);
+  echo();
+  curs_set(1);
+  mvprintw(LINES - 2, 1, "%s", label);
+  if (original[0]) {
+    printw("[%s] ", original);
+  }
+  clrtoeol();
+  label_col = (int)strlen(label) + 1;
+  if (original[0]) {
+    label_col += (int)strlen(original) + 3;
+  }
+  move(LINES - 2, label_col);
+
+  rc = getnstr(input, (int)len - 1);
+  if (rc != ERR) {
+    if (input[0]) {
+      snprintf(buf, len, "%s", input);
+    } else if (original[0]) {
+      snprintf(buf, len, "%s", original);
+    } else {
+      rc = ERR;
+    }
+  }
+
+  noecho();
+  curs_set(0);
+  nodelay(stdscr, TRUE);
+
+  free(input);
+  free(original);
+  return rc == ERR ? -1 : 0;
+}
+
+static int prompt_confirm(const char *message) {
+  int ch;
+
+  nodelay(stdscr, FALSE);
+  noecho();
+  curs_set(0);
+  mvprintw(LINES - 2, 1, "%s [y/N] ", message);
+  clrtoeol();
+  ch = getch();
+  nodelay(stdscr, TRUE);
+  return ch == 'y' || ch == 'Y';
+}
+
+static void upload_selected(struct AppState *app) {
+  struct LocalEntry *entry;
+  char local_path[PATH_MAX];
+  char remote_name[RMTDOS_PATH_BYTES];
+  char remote_path[FILE_TRANSFER_NAME_BYTES];
+  int rc;
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  if (entry->is_dir) {
+    set_status(app, "Select a local file before uploading.");
+    return;
+  }
+
+  if (strlen(entry->name) >= sizeof(remote_name)) {
+    set_status(app, "Remote filename is too long.");
+    return;
+  }
+  strcpy(remote_name, entry->name);
+  if (prompt_text("Remote DOS filename: ", remote_name, sizeof(remote_name))) {
+    set_status(app, "Upload cancelled.");
+    return;
+  }
+
+  if (remote_path_join(remote_path, sizeof(remote_path), app->remote_path,
+                       remote_name)) {
+    set_status(app, "Remote transfer path must fit in %d characters.",
+               FILE_TRANSFER_NAME_BYTES - 1);
+    return;
+  }
+
+  if (join_path(local_path, sizeof(local_path), app->local.cwd, entry->name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  def_prog_mode();
+  endwin();
+  rc = file_transfer_put(&app->sock, app->active_host->if_addr, local_path,
+                         remote_path);
+  shell_transfer_pause();
+  reset_prog_mode();
+  ui_reset();
+
+  if (!rc) {
+    remote_panel_load(app);
+  }
+  set_status(app, rc ? "Upload failed." : "Upload complete.");
+}
+
+static int download_remote_file_to(struct AppState *app, const char *remote_name,
+                                   const char *local_path) {
+  char remote_path[FILE_TRANSFER_NAME_BYTES];
+
+  if (remote_path_join(remote_path, sizeof(remote_path), app->remote_path,
+                       remote_name)) {
+    set_status(app, "Remote transfer path must fit in %d characters.",
+               FILE_TRANSFER_NAME_BYTES - 1);
+    return -1;
+  }
+
+  return file_transfer_get(&app->sock, app->active_host->if_addr, remote_path,
+                           local_path);
+}
+
+static void download_prompted(struct AppState *app) {
+  char remote_name[RMTDOS_PATH_BYTES];
+  char local_name[NAME_MAX + 1];
+  char local_path[PATH_MAX];
+  int rc;
+
+  memset(remote_name, 0, sizeof(remote_name));
+  if (app->focus == FOCUS_REMOTE && app->remote.loaded &&
+      app->remote.count > 0 &&
+      !app->remote.entries[app->remote.selected].is_dir) {
+    snprintf(remote_name, sizeof(remote_name), "%s",
+             app->remote.entries[app->remote.selected].name);
+  }
+
+  if (prompt_text("Remote DOS filename: ", remote_name, sizeof(remote_name))) {
+    set_status(app, "Download cancelled.");
+    return;
+  }
+  snprintf(local_name, sizeof(local_name), "%s", remote_name);
+  if (prompt_text("Local filename: ", local_name, sizeof(local_name))) {
+    set_status(app, "Download cancelled.");
+    return;
+  }
+
+  if (join_path(local_path, sizeof(local_path), app->local.cwd, local_name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  def_prog_mode();
+  endwin();
+  rc = download_remote_file_to(app, remote_name, local_path);
+  shell_transfer_pause();
+  reset_prog_mode();
+  ui_reset();
+
+  if (!rc) {
+    local_panel_load(&app->local, app->local.cwd);
+  }
+  set_status(app, rc ? "Download failed." : "Download complete.");
+}
+
+static void view_local_selected(struct AppState *app) {
+  struct LocalEntry *entry;
+  char local_path[PATH_MAX];
+  char opened_name[NAME_MAX + 1];
+  int rc;
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  snprintf(opened_name, sizeof(opened_name), "%s", entry->name);
+  if (entry->is_dir) {
+    local_panel_enter(app);
+    return;
+  }
+
+  if (join_path(local_path, sizeof(local_path), app->local.cwd, entry->name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  def_prog_mode();
+  endwin();
+  rc = run_pager_shell(local_path);
+  reset_prog_mode();
+  ui_reset();
+
+  set_status(app, rc ? "Viewer failed." : "Viewed %s", opened_name);
+}
+
+static void edit_local_selected(struct AppState *app) {
+  struct LocalEntry *entry;
+  char local_path[PATH_MAX];
+  char opened_name[NAME_MAX + 1];
+  int rc;
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  snprintf(opened_name, sizeof(opened_name), "%s", entry->name);
+  if (entry->is_dir) {
+    local_panel_enter(app);
+    return;
+  }
+
+  if (join_path(local_path, sizeof(local_path), app->local.cwd, entry->name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  def_prog_mode();
+  endwin();
+  rc = run_editor_shell(local_path);
+  reset_prog_mode();
+  ui_reset();
+
+  local_panel_load(&app->local, app->local.cwd);
+  set_status(app, rc ? "Editor failed." : "Edited %s", opened_name);
+}
+
+static void view_remote_selected(struct AppState *app) {
+  struct RemoteDirEntry *entry;
+  char tmp_template[] = "/tmp/rmtdos-file-commander-XXXXXX";
+  char tmp_name[NAME_MAX + 1];
+  char tmp_path[PATH_MAX];
+  char remote_path[FILE_TRANSFER_NAME_BYTES];
+  char *tmp_dir;
+  int rc = -1;
+  const char *result = "Remote view failed.";
+
+  if (!app->remote.loaded || app->remote.count <= 0) {
+    set_status(app, "Remote directory is empty or not loaded.");
+    return;
+  }
+
+  entry = &app->remote.entries[app->remote.selected];
+  if (entry->is_dir) {
+    remote_panel_enter(app);
+    return;
+  }
+
+  if (remote_path_join(remote_path, sizeof(remote_path), app->remote_path,
+                       entry->name)) {
+    set_status(app, "Remote transfer path must fit in %d characters.",
+               FILE_TRANSFER_NAME_BYTES - 1);
+    return;
+  }
+
+  tmp_dir = mkdtemp(tmp_template);
+  if (!tmp_dir) {
+    set_status(app, "Could not create temp directory: %s", strerror(errno));
+    return;
+  }
+
+  safe_temp_name(tmp_name, sizeof(tmp_name), entry->name);
+  if (join_path(tmp_path, sizeof(tmp_path), tmp_dir, tmp_name)) {
+    remove_temp_edit(NULL, tmp_dir);
+    set_status(app, "Temp path is too long.");
+    return;
+  }
+
+  def_prog_mode();
+  endwin();
+
+  printf("Downloading %s for view...\n", remote_path);
+  if (file_transfer_get(&app->sock, app->active_host->if_addr, remote_path,
+                        tmp_path)) {
+    result = "Remote view failed: download failed.";
+    goto done;
+  }
+
+  printf("\nOpening %s with %s...\n", tmp_path, pager_name());
+  rc = run_pager_shell(tmp_path);
+  result = rc ? "Remote view failed: viewer exited with an error."
+              : "Remote view complete.";
+
+done:
+  remove_temp_edit(tmp_path, tmp_dir);
+  shell_transfer_pause();
+  reset_prog_mode();
+  ui_reset();
+  set_status(app, "%s", result);
+}
+
+static void edit_remote_selected(struct AppState *app) {
+  struct RemoteDirEntry *entry;
+  char tmp_template[] = "/tmp/rmtdos-file-commander-XXXXXX";
+  char tmp_name[NAME_MAX + 1];
+  char tmp_path[PATH_MAX];
+  char remote_path[FILE_TRANSFER_NAME_BYTES];
+  char *tmp_dir;
+  unsigned long before_hash = 0;
+  unsigned long after_hash = 0;
+  off_t before_size = 0;
+  off_t after_size = 0;
+  int rc = -1;
+  int downloaded = 0;
+  int keep_temp = 0;
+  const char *result = "Remote edit failed.";
+
+  if (!app->remote.loaded || app->remote.count <= 0) {
+    set_status(app, "Remote directory is empty or not loaded.");
+    return;
+  }
+
+  entry = &app->remote.entries[app->remote.selected];
+  if (entry->is_dir) {
+    remote_panel_enter(app);
+    return;
+  }
+
+  if (remote_path_join(remote_path, sizeof(remote_path), app->remote_path,
+                       entry->name)) {
+    set_status(app, "Remote transfer path must fit in %d characters.",
+               FILE_TRANSFER_NAME_BYTES - 1);
+    return;
+  }
+
+  tmp_dir = mkdtemp(tmp_template);
+  if (!tmp_dir) {
+    set_status(app, "Could not create temp directory: %s", strerror(errno));
+    return;
+  }
+
+  safe_temp_name(tmp_name, sizeof(tmp_name), entry->name);
+  if (join_path(tmp_path, sizeof(tmp_path), tmp_dir, tmp_name)) {
+    set_status(app, "Temp path is too long.");
+    remove_temp_edit(NULL, tmp_dir);
+    return;
+  }
+
+  def_prog_mode();
+  endwin();
+
+  printf("Downloading %s for edit...\n", remote_path);
+  if (file_transfer_get(&app->sock, app->active_host->if_addr, remote_path,
+                        tmp_path)) {
+    result = "Remote edit failed: download failed.";
+    goto done;
+  }
+  downloaded = 1;
+
+  if (file_fingerprint(tmp_path, &before_hash, &before_size)) {
+    result = "Remote edit failed: cannot read temp file.";
+    keep_temp = 1;
+    goto done;
+  }
+
+  printf("\nOpening %s with %s...\n", tmp_path, editor_name());
+  if (run_editor_shell(tmp_path)) {
+    result = "Remote edit failed: editor exited with an error.";
+    keep_temp = 1;
+    goto done;
+  }
+
+  if (file_fingerprint(tmp_path, &after_hash, &after_size)) {
+    result = "Remote edit failed: cannot re-read temp file.";
+    keep_temp = 1;
+    goto done;
+  }
+
+  if (before_hash != after_hash || before_size != after_size) {
+    if (shell_prompt_upload_choice(remote_path, tmp_path)) {
+      rc = file_transfer_put(&app->sock, app->active_host->if_addr, tmp_path,
+                             remote_path);
+      result = rc ? "Remote edit failed: upload failed."
+                  : "Remote edit complete; changes uploaded.";
+      if (rc) {
+        keep_temp = 1;
+      }
+    } else {
+      rc = 0;
+      keep_temp = 1;
+      result = "Remote edit complete; changes kept local only.";
+    }
+  } else {
+    rc = 0;
+    result = "Remote edit complete; file unchanged.";
+  }
+
+done:
+  if (keep_temp && downloaded) {
+    printf("\nKept edited temp copy: %s\n", tmp_path);
+  } else {
+    remove_temp_edit(tmp_path, tmp_dir);
+  }
+  shell_transfer_pause();
+  reset_prog_mode();
+  ui_reset();
+
+  if (!rc) {
+    remote_panel_load(app);
+  }
+  set_status(app, "%s", result);
+}
+
+static void copy_selected(struct AppState *app) {
+  struct LocalEntry *entry;
+  struct RemoteDirEntry *remote_entry;
+  char src_path[PATH_MAX];
+  char src_name[NAME_MAX + 1];
+  char dst_name[NAME_MAX + 1];
+  char dst_path[PATH_MAX];
+  char remote_source[FILE_TRANSFER_NAME_BYTES];
+  char remote_target[FILE_TRANSFER_NAME_BYTES];
+  struct stat st;
+  FILE *src;
+  FILE *dst;
+  unsigned char buf[8192];
+  size_t n;
+  int rc;
+
+  if (app->focus == FOCUS_REMOTE) {
+    if (!app->remote.loaded || app->remote.count <= 0) {
+      return;
+    }
+
+    remote_entry = &app->remote.entries[app->remote.selected];
+    if (remote_entry->is_dir) {
+      set_status(app, "Remote directory copy is not implemented.");
+      return;
+    }
+
+    if (remote_path_join(remote_source, sizeof(remote_source), app->remote_path,
+                         remote_entry->name)) {
+      set_status(app, "Remote transfer path must fit in %d characters.",
+                 FILE_TRANSFER_NAME_BYTES - 1);
+      return;
+    }
+
+    snprintf(dst_name, sizeof(dst_name), "%s", remote_entry->name);
+    strncat(dst_name, ".CPY", sizeof(dst_name) - strlen(dst_name) - 1);
+    if (prompt_text("Remote copy to: ", dst_name, sizeof(dst_name))) {
+      set_status(app, "Copy cancelled.");
+      return;
+    }
+
+    if (remote_path_join(remote_target, sizeof(remote_target), app->remote_path,
+                         dst_name)) {
+      set_status(app, "Remote transfer path must fit in %d characters.",
+                 FILE_TRANSFER_NAME_BYTES - 1);
+      return;
+    }
+
+    if (!strcasecmp(remote_source, remote_target)) {
+      set_status(app, "Remote copy destination must be different.");
+      return;
+    }
+
+    if (remote_name_exists(&app->remote, dst_name) &&
+        !prompt_confirm("Remote destination exists. Overwrite?")) {
+      set_status(app, "Copy cancelled.");
+      return;
+    }
+
+    def_prog_mode();
+    endwin();
+    rc = file_remote_copy(&app->sock, app->active_host->if_addr, remote_source,
+                          remote_target);
+    shell_transfer_pause();
+    reset_prog_mode();
+    ui_reset();
+
+    if (!rc) {
+      remote_panel_load(app);
+    }
+    set_status(app, rc ? "Remote copy failed." : "Remote copy complete.");
+    return;
+  }
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  if (entry->is_dir) {
+    set_status(app, "Local directory copy is not implemented.");
+    return;
+  }
+  snprintf(src_name, sizeof(src_name), "%s", entry->name);
+
+  if (join_path(src_path, sizeof(src_path), app->local.cwd, src_name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  snprintf(dst_name, sizeof(dst_name), "%s", src_name);
+  strncat(dst_name, ".copy", sizeof(dst_name) - strlen(dst_name) - 1);
+  if (prompt_text("Copy to: ", dst_name, sizeof(dst_name))) {
+    set_status(app, "Copy cancelled.");
+    return;
+  }
+
+  if (join_path(dst_path, sizeof(dst_path), app->local.cwd, dst_name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  if (!strcmp(src_path, dst_path)) {
+    set_status(app, "Copy destination must be different.");
+    return;
+  }
+
+  if (!stat(dst_path, &st) && !prompt_confirm("Destination exists. Overwrite?")) {
+    set_status(app, "Copy cancelled.");
+    return;
+  }
+
+  src = fopen(src_path, "rb");
+  if (!src) {
+    set_status(app, "Copy failed: %s", strerror(errno));
+    return;
+  }
+
+  dst = fopen(dst_path, "wb");
+  if (!dst) {
+    fclose(src);
+    set_status(app, "Copy failed: %s", strerror(errno));
+    return;
+  }
+
+  while ((n = fread(buf, 1, sizeof(buf), src)) > 0) {
+    if (fwrite(buf, 1, n, dst) != n) {
+      fclose(src);
+      fclose(dst);
+      set_status(app, "Copy failed: %s", strerror(errno));
+      return;
+    }
+  }
+
+  if (ferror(src) || fclose(dst)) {
+    fclose(src);
+    set_status(app, "Copy failed: %s", strerror(errno));
+    return;
+  }
+  fclose(src);
+
+  local_panel_load(&app->local, app->local.cwd);
+  set_status(app, "Copied %s to %s", src_name, dst_name);
+}
+
+static void mkdir_selected(struct AppState *app) {
+  char name[NAME_MAX + 1] = "";
+  char path[PATH_MAX];
+  char remote_path[FILE_TRANSFER_NAME_BYTES];
+  int rc;
+
+  if (app->focus == FOCUS_REMOTE) {
+    if (prompt_text("New remote directory: ", name, sizeof(name))) {
+      set_status(app, "Mkdir cancelled.");
+      return;
+    }
+
+    if (remote_path_join(remote_path, sizeof(remote_path), app->remote_path,
+                         name)) {
+      set_status(app, "Remote transfer path must fit in %d characters.",
+                 FILE_TRANSFER_NAME_BYTES - 1);
+      return;
+    }
+
+    def_prog_mode();
+    endwin();
+    rc = file_remote_mkdir(&app->sock, app->active_host->if_addr, remote_path);
+    shell_transfer_pause();
+    reset_prog_mode();
+    ui_reset();
+
+    if (!rc) {
+      remote_panel_load(app);
+    }
+    set_status(app, rc ? "Remote mkdir failed." : "Remote directory created.");
+    return;
+  }
+
+  if (prompt_text("New directory: ", name, sizeof(name))) {
+    set_status(app, "Mkdir cancelled.");
+    return;
+  }
+
+  if (join_path(path, sizeof(path), app->local.cwd, name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  if (mkdir(path, 0777)) {
+    set_status(app, "Mkdir failed: %s", strerror(errno));
+    return;
+  }
+
+  local_panel_load(&app->local, app->local.cwd);
+  set_status(app, "Created directory %s", name);
+}
+
+static void rename_move_selected(struct AppState *app) {
+  struct LocalEntry *entry;
+  struct RemoteDirEntry *remote_entry;
+  char old_path[PATH_MAX];
+  char new_name[NAME_MAX + 1];
+  char new_path[PATH_MAX];
+  char remote_source[FILE_TRANSFER_NAME_BYTES];
+  char remote_target[FILE_TRANSFER_NAME_BYTES];
+  struct stat st;
+  int rc;
+
+  if (app->focus == FOCUS_REMOTE) {
+    if (!app->remote.loaded || app->remote.count <= 0) {
+      return;
+    }
+
+    remote_entry = &app->remote.entries[app->remote.selected];
+    if (!strcmp(remote_entry->name, ".") || !strcmp(remote_entry->name, "..")) {
+      set_status(app, "Cannot rename navigation entry.");
+      return;
+    }
+
+    if (remote_path_join(remote_source, sizeof(remote_source), app->remote_path,
+                         remote_entry->name)) {
+      set_status(app, "Remote transfer path must fit in %d characters.",
+                 FILE_TRANSFER_NAME_BYTES - 1);
+      return;
+    }
+
+    snprintf(new_name, sizeof(new_name), "%s", remote_entry->name);
+    if (prompt_text("Remote rename/move to: ", new_name, sizeof(new_name))) {
+      set_status(app, "Rename/move cancelled.");
+      return;
+    }
+
+    if (remote_path_join(remote_target, sizeof(remote_target), app->remote_path,
+                         new_name)) {
+      set_status(app, "Remote transfer path must fit in %d characters.",
+                 FILE_TRANSFER_NAME_BYTES - 1);
+      return;
+    }
+
+    if (!strcasecmp(remote_source, remote_target)) {
+      set_status(app, "Remote rename/move destination must be different.");
+      return;
+    }
+
+    if (remote_name_exists(&app->remote, new_name)) {
+      set_status(app, "Remote target already exists.");
+      return;
+    }
+
+    def_prog_mode();
+    endwin();
+    rc = file_remote_rename(&app->sock, app->active_host->if_addr,
+                            remote_source, remote_target);
+    shell_transfer_pause();
+    reset_prog_mode();
+    ui_reset();
+
+    if (!rc) {
+      remote_panel_load(app);
+    }
+    set_status(app, rc ? "Remote rename/move failed."
+                       : "Remote rename/move complete.");
+    return;
+  }
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  if (!strcmp(entry->name, "..")) {
+    set_status(app, "Cannot rename parent directory entry.");
+    return;
+  }
+
+  snprintf(new_name, sizeof(new_name), "%s", entry->name);
+  if (prompt_text("Rename/move to: ", new_name, sizeof(new_name))) {
+    set_status(app, "Rename/move cancelled.");
+    return;
+  }
+
+  if (join_path(old_path, sizeof(old_path), app->local.cwd, entry->name) ||
+      join_path(new_path, sizeof(new_path), app->local.cwd, new_name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  if (!strcmp(old_path, new_path)) {
+    set_status(app, "Rename/move destination must be different.");
+    return;
+  }
+
+  if (!stat(new_path, &st) && !prompt_confirm("Destination exists. Overwrite?")) {
+    set_status(app, "Rename/move cancelled.");
+    return;
+  }
+
+  if (rename(old_path, new_path)) {
+    set_status(app, "Rename/move failed: %s", strerror(errno));
+    return;
+  }
+
+  local_panel_load(&app->local, app->local.cwd);
+  set_status(app, "Renamed/moved to %s", new_name);
+}
+
+static void delete_selected(struct AppState *app) {
+  struct LocalEntry *entry;
+  struct RemoteDirEntry *remote_entry;
+  char path[PATH_MAX];
+  char prompt[NAME_MAX + 64];
+  char deleted_name[NAME_MAX + 1];
+  char remote_path[FILE_TRANSFER_NAME_BYTES];
+  int rc;
+
+  if (app->focus == FOCUS_REMOTE) {
+    if (!app->remote.loaded || app->remote.count <= 0) {
+      return;
+    }
+
+    remote_entry = &app->remote.entries[app->remote.selected];
+    if (!strcmp(remote_entry->name, ".") || !strcmp(remote_entry->name, "..")) {
+      set_status(app, "Cannot delete navigation entry.");
+      return;
+    }
+
+    snprintf(deleted_name, sizeof(deleted_name), "%s", remote_entry->name);
+    snprintf(prompt, sizeof(prompt), "Delete remote %s?", deleted_name);
+    if (!prompt_confirm(prompt)) {
+      set_status(app, "Delete cancelled.");
+      return;
+    }
+
+    if (remote_path_join(remote_path, sizeof(remote_path), app->remote_path,
+                         deleted_name)) {
+      set_status(app, "Remote transfer path must fit in %d characters.",
+                 FILE_TRANSFER_NAME_BYTES - 1);
+      return;
+    }
+
+    def_prog_mode();
+    endwin();
+    rc = file_remote_delete(&app->sock, app->active_host->if_addr, remote_path,
+                            remote_entry->is_dir);
+    shell_transfer_pause();
+    reset_prog_mode();
+    ui_reset();
+
+    if (!rc) {
+      remote_panel_load(app);
+    }
+    set_status(app, rc ? "Remote delete failed." : "Remote delete complete.");
+    return;
+  }
+
+  if (app->local.count <= 0) {
+    return;
+  }
+
+  entry = &app->local.entries[app->local.selected];
+  if (!strcmp(entry->name, "..")) {
+    set_status(app, "Cannot delete parent directory entry.");
+    return;
+  }
+  snprintf(deleted_name, sizeof(deleted_name), "%s", entry->name);
+
+  snprintf(prompt, sizeof(prompt), "Delete %s?", deleted_name);
+  if (!prompt_confirm(prompt)) {
+    set_status(app, "Delete cancelled.");
+    return;
+  }
+
+  if (join_path(path, sizeof(path), app->local.cwd, deleted_name)) {
+    set_status(app, "Local path is too long.");
+    return;
+  }
+
+  if ((entry->is_dir ? rmdir(path) : unlink(path))) {
+    set_status(app, "Delete failed: %s", strerror(errno));
+    return;
+  }
+
+  local_panel_load(&app->local, app->local.cwd);
+  set_status(app, "Deleted %s", deleted_name);
+}
+
+static void process_commander_key(struct AppState *app, int ch) {
+  struct LocalPanel *local = &app->local;
+  struct RemotePanel *remote = &app->remote;
+
+  if (is_exit_key(ch)) {
+    app->running = 0;
+    return;
+  }
+
+  switch (ch) {
+    case '\t':
+      app->focus = app->focus == FOCUS_REMOTE ? FOCUS_LOCAL : FOCUS_REMOTE;
+      break;
+    case KEY_UP:
+      if (app->focus == FOCUS_LOCAL && local->selected > 0) {
+        --local->selected;
+      } else if (app->focus == FOCUS_REMOTE && remote->selected > 0) {
+        --remote->selected;
+      }
+      break;
+    case KEY_DOWN:
+      if (app->focus == FOCUS_LOCAL && local->selected < local->count - 1) {
+        ++local->selected;
+      } else if (app->focus == FOCUS_REMOTE &&
+                 remote->selected < remote->count - 1) {
+        ++remote->selected;
+      }
+      break;
+    case '\n':
+    case KEY_ENTER:
+      if (app->focus == FOCUS_LOCAL) {
+        view_local_selected(app);
+      } else {
+        view_remote_selected(app);
+      }
+      break;
+    case 'v':
+    case 'V':
+    case KEY_F(3):
+      if (app->focus == FOCUS_LOCAL) {
+        view_local_selected(app);
+      } else {
+        view_remote_selected(app);
+      }
+      break;
+    case 'e':
+    case 'E':
+    case KEY_F(4):
+      if (app->focus == FOCUS_LOCAL) {
+        edit_local_selected(app);
+      } else {
+        edit_remote_selected(app);
+      }
+      break;
+    case KEY_F(2):
+      if (app->focus != FOCUS_LOCAL) {
+        set_status(app, "Switch to the local pane to upload a selected file.");
+      } else {
+        upload_selected(app);
+      }
+      break;
+    case 'c':
+    case 'C':
+    case KEY_F(5):
+      copy_selected(app);
+      break;
+    case 'n':
+    case 'N':
+    case KEY_F(6):
+      rename_move_selected(app);
+      break;
+    case 'm':
+    case 'M':
+    case KEY_F(7):
+      mkdir_selected(app);
+      break;
+    case 'x':
+    case 'X':
+    case KEY_F(8):
+      delete_selected(app);
+      break;
+    case KEY_F(9):
+      download_prompted(app);
+      break;
+    case KEY_F(10):
+      app->running = 0;
+      break;
+    case 'u':
+    case 'U':
+      if (app->focus != FOCUS_LOCAL) {
+        set_status(app, "Switch to the local pane to upload a selected file.");
+      } else {
+        upload_selected(app);
+      }
+      break;
+    case 'd':
+    case 'D':
+      download_prompted(app);
+      break;
+    case 'r':
+    case 'R':
+      if (app->focus == FOCUS_REMOTE) {
+        remote_panel_load(app);
+      } else if (local_panel_load(local, local->cwd)) {
+        set_status(app, "Refresh failed: %s", strerror(errno));
+      } else {
+        set_status(app, "Refreshed %s", local->cwd);
+      }
+      break;
+  }
+}
+
+static void run_commander(struct AppState *app) {
+  struct timeval last_session = {0};
+  set_status(app, "Connected. Loading remote DOS directory...");
+  remote_panel_load(app);
+
+  while (app->running) {
+    struct timeval now;
+    struct timeval diff;
+    int ch;
+
+    gettimeofday(&now, NULL);
+    timersub(&now, &last_session, &diff);
+    if (!timerisset(&last_session) || diff.tv_sec >= 2) {
+      send_session_start(&app->sock, app->active_host->if_addr);
+      last_session = now;
+    }
+
+    while (socket_has_data(app->sock.sock_fd, 1)) {
+      process_incoming_packet(app);
+    }
+
+    draw_commander(app);
+    ch = getch();
+    if (ch != ERR) {
+      process_commander_key(app, ch);
+    }
+  }
+}
+
+int commander_run(const struct CommanderConfig *config) {
+  struct AppState app;
+  int rc = 1;
+
+  memset(&app, 0, sizeof(app));
+  app.running = 1;
+  app.focus = FOCUS_LOCAL;
+  snprintf(app.remote_path, sizeof(app.remote_path), "C:\\");
+  set_status(&app, "Starting...");
+
+  if (create_socket(&app.sock, config->if_name, config->ethertype) < 0) {
+    return 1;
+  }
+
+  hostlist_create();
+
+  if (local_panel_load(&app.local, ".")) {
+    perror("local directory");
+    goto out_socket;
+  }
+
+  initscr();
+  cbreak();
+  noecho();
+  keypad(stdscr, TRUE);
+  nodelay(stdscr, TRUE);
+  curs_set(0);
+  start_color();
+  use_default_colors();
+  init_pair(1, COLOR_BLACK, COLOR_CYAN);
+  init_pair(2, COLOR_CYAN, -1);
+  init_pair(3, COLOR_BLACK, COLOR_WHITE);
+
+  app.active_host = run_selector(&app);
+  if (app.active_host) {
+    run_commander(&app);
+  }
+
+  endwin();
+  rc = 0;
+
+out_socket:
+  hostlist_destroy();
+  close_socket(&app.sock);
+  return rc;
+}
