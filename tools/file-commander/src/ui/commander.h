@@ -10,6 +10,8 @@
 struct CommanderConfig {
   const char *if_name;
   uint16_t ethertype;
+  int host_addr_set;
+  uint8_t host_addr[6];
 };
 
 int commander_run(const struct CommanderConfig *config);

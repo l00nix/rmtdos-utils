@@ -69,6 +69,7 @@ struct RemotePanel {
 struct AppState {
   struct RawSocket sock;
   struct RemoteHost *active_host;
+  struct RemoteHost direct_host;
   struct LocalPanel local;
   struct RemotePanel remote;
   enum FocusPane focus;
@@ -1680,7 +1681,16 @@ int commander_run(const struct CommanderConfig *config) {
   init_pair(2, COLOR_CYAN, -1);
   init_pair(3, COLOR_BLACK, COLOR_WHITE);
 
-  app.active_host = run_selector(&app);
+  if (config->host_addr_set) {
+    memset(&app.direct_host, 0, sizeof(app.direct_host));
+    app.direct_host.index = 0;
+    memcpy(app.direct_host.if_addr, config->host_addr,
+           sizeof(app.direct_host.if_addr));
+    gettimeofday(&app.direct_host.tv_last_resp, NULL);
+    app.active_host = &app.direct_host;
+  } else {
+    app.active_host = run_selector(&app);
+  }
   if (app.active_host) {
     run_commander(&app);
   }

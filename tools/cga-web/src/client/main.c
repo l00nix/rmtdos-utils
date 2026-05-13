@@ -74,9 +74,13 @@ static struct timeval g_last_probe = {0};
 static int g_enable_web = 0;
 static char g_web_addr[INET_ADDRSTRLEN] = "127.0.0.1";
 static int g_web_port = 8080;
+static int g_autoconnect_host_set = 0;
+static uint8_t g_autoconnect_host[ETH_ALEN] = {0};
 
 // Non-NULL if we're actively controlling a server.
 struct RemoteHost *g_active_host = NULL;
+
+void start_remote_control(struct RemoteHost *rh);
 
 void update_probing_window(const struct RawSocket *rs) {
   struct timeval tv_now;
@@ -256,6 +260,13 @@ void process_socket_io(struct RawSocket *rs) {
   switch (ntohs(ph->pkt_type)) {
     case V1_STATUS_RESP:
       hostlist_register(buf, received);
+      if (g_autoconnect_host_set && !g_active_host &&
+          !memcmp(eh->ether_shost, g_autoconnect_host, ETH_ALEN)) {
+        struct RemoteHost *rh = hostlist_find_by_mac(eh->ether_shost);
+        if (rh) {
+          start_remote_control(rh);
+        }
+      }
       break;
     case V1_VGA_TEXT:
       process_incoming_video_text(buf, received);
@@ -407,7 +418,7 @@ static int parse_web_listen_arg(const char *arg, char *addr, size_t addr_len,
   return 0;
 }
 
-int main(int argc, char **argv) {
+int rmtdos_cga_web_client_main(int argc, char **argv) {
   const char *if_name = DEFAULT_ETH_DEV;
   uint16_t ethertype = ETHERTYPE_RMTDOS;
   uint8_t dest_addr[ETH_ALEN] = {0};
@@ -431,6 +442,17 @@ int main(int argc, char **argv) {
   // http://yjlv.blogspot.com/2015/10/displaying-unicode-with-ncurses-in-c.html
   setlocale(LC_ALL, "");
   cp437_table_init();
+
+  g_app_mode = MODE_PROBING;
+  g_running = 1;
+  g_show_debug_window = 0;
+  g_web_server.listen_fd = -1;
+  timerclear(&g_last_probe);
+  g_enable_web = 0;
+  snprintf(g_web_addr, sizeof(g_web_addr), "%s", DEFAULT_WEB_ADDR);
+  g_web_port = DEFAULT_WEB_PORT;
+  g_autoconnect_host_set = 0;
+  g_active_host = NULL;
 
   memcpy(dest_addr, broadcast_addr, ETH_ALEN);
   hostlist_create();
@@ -470,6 +492,8 @@ int main(int argc, char **argv) {
           dest_addr[i] = mac[i];
         }
         dest_addr_set = 1;
+        memcpy(g_autoconnect_host, dest_addr, ETH_ALEN);
+        g_autoconnect_host_set = 1;
       } break;
 
       case 'e':
@@ -658,3 +682,9 @@ int main(int argc, char **argv) {
 
   return 0;
 }
+
+#ifndef RMTDOS_CGA_WEB_NO_MAIN
+int main(int argc, char **argv) {
+  return rmtdos_cga_web_client_main(argc, argv);
+}
+#endif

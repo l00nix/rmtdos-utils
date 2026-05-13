@@ -1,7 +1,9 @@
 # rmtdos-utils
 
-`rmtdos-utils` is the umbrella home for the modern rmtdos utility family:
+`rmtdos-utils` is the umbrella home for the modern rmtdos utility family and
+the preferred Linux-side launcher for remote DOS sessions:
 
+- `rmtdos-utils`: unified host selector and mode launcher.
 - `tools/cga-web`: DOS TSR, Linux remote-control client, CGA web viewer, and
   demo programs from `rmtdos-cga-web`.
 - `tools/file-commander`: dual-pane ncurses file manager for a Linux machine
@@ -31,6 +33,12 @@ Build everything:
 make
 ```
 
+The unified Linux binary is written to:
+
+```sh
+out/rmtdos-utils
+```
+
 Build a single tool:
 
 ```sh
@@ -42,6 +50,29 @@ The individual projects still own their detailed dependency notes:
 
 - [tools/cga-web/README.md](tools/cga-web/README.md)
 - [tools/file-commander/README.md](tools/file-commander/README.md)
+
+## Unified Launcher
+
+Run the unified launcher on Linux:
+
+```sh
+sudo ./out/rmtdos-utils -i enp2s0
+```
+
+The launcher probes the LAN once, lets you select a DOS host, then asks whether
+to open the remote shell or the file commander for that host.
+
+Optional shell-mode CGA web view:
+
+```sh
+sudo ./out/rmtdos-utils -i enp2s0 -w
+sudo ./out/rmtdos-utils -i enp2s0 -W 0.0.0.0:8080
+```
+
+The legacy Linux binaries are still built by their companion projects:
+
+- `tools/cga-web/out/rmtdos-cga-web-client`
+- `tools/file-commander/out/rmtdos-file-commander`
 
 ## Project Lineage
 
