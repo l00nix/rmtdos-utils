@@ -23,7 +23,7 @@
 #include "client/util.h"
 #include "common/protocol.h"
 
-#define RMTDOS_UTILS_VERSION "rmtdos-utils v0.1.0"
+#define RMTDOS_UTILS_VERSION "rmtdos-utils v0.1.1"
 
 enum LaunchMode {
   LAUNCH_NONE = 0,
