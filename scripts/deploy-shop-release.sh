@@ -30,14 +30,11 @@ $ssh_cmd "$target" "
   set -eu
   cd '$dest'
   cp -f 'rmtdos-utils-$version-linux-x86_64' rmtdos-utils
-  cp -f 'rmtdos-cga-web-client-$version-linux-x86_64' rmtdos-cga-web-client
-  cp -f 'rmtdos-file-commander-$version-linux-x86_64' rmtdos-file-commander
   cp -f 'cgaweb-$version.com' cgaweb.com
   cp -f 'cga_demo-$version.com' cga_demo.com
   cp -f 'vga_demo-$version.com' vga_demo.com
+  rm -f rmtdos-cga-web-client rmtdos-file-commander
   chmod +x rmtdos-utils rmtdos-utils-$version-linux-x86_64
-  chmod +x rmtdos-cga-web-client rmtdos-cga-web-client-$version-linux-x86_64
-  chmod +x rmtdos-file-commander rmtdos-file-commander-$version-linux-x86_64
   chmod +x *.com
   sha256sum -c SHA256SUMS
 "

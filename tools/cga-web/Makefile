@@ -35,7 +35,15 @@ CGADEMO_MAP=$(OUTDIR)/cga_demo.map
 # Library of functions used in more than one 16-bit build target.
 LIB16_LIB=$(TMPDIR)/lib16.a
 
-all:	dirs $(CLIENT_BIN) $(RMTDOS_BIN) $(VGADEMO_BIN) $(CGADEMO_BIN) list
+.PHONY: all dos client legacy-all clean dirs list format setcap typos bcclint
+
+all:	dos
+
+dos:	dirs $(RMTDOS_BIN) $(VGADEMO_BIN) $(CGADEMO_BIN) list
+
+client:	dirs $(CLIENT_BIN) list
+
+legacy-all:	dirs $(CLIENT_BIN) $(RMTDOS_BIN) $(VGADEMO_BIN) $(CGADEMO_BIN) list
 
 clean:
 	@rm -rf $(OUTDIR) $(TMPDIR)

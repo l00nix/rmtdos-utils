@@ -23,7 +23,7 @@
 #include "client/util.h"
 #include "common/protocol.h"
 
-#define RMTDOS_UTILS_VERSION "rmtdos-utils v0.1.1"
+#define RMTDOS_UTILS_VERSION "rmtdos-utils v0.2.0"
 
 enum LaunchMode {
   LAUNCH_NONE = 0,
@@ -235,7 +235,7 @@ static int run_shell_mode(const char *if_name, uint16_t ethertype,
   snprintf(ethertype_text, sizeof(ethertype_text), "%04x", ethertype);
   mac_to_text(mac_text, sizeof(mac_text), host_addr);
 
-  argv[argc++] = "rmtdos-cga-web-client";
+  argv[argc++] = "rmtdos-utils-shell";
   argv[argc++] = "-i";
   argv[argc++] = (char *)if_name;
   argv[argc++] = "-e";

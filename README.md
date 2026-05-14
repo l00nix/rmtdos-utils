@@ -27,13 +27,13 @@ convenience targets for building, cleaning, and formatting the whole collection.
 
 ## Building
 
-Build everything:
+Build the unified Linux launcher and the DOS programs:
 
 ```sh
 make
 ```
 
-The unified Linux binary is written to:
+The Linux binary is written to:
 
 ```sh
 out/rmtdos-utils
@@ -71,10 +71,15 @@ sudo ./out/rmtdos-utils -i enp2s0 -w
 sudo ./out/rmtdos-utils -i enp2s0 -W 0.0.0.0:8080
 ```
 
-The legacy Linux binaries are still built by their companion projects:
+The old standalone Linux clients are no longer primary `rmtdos-utils`
+deliverables. For compatibility testing, they can still be built explicitly:
 
-- `tools/cga-web/out/rmtdos-cga-web-client`
-- `tools/file-commander/out/rmtdos-file-commander`
+```sh
+make legacy-linux
+```
+
+Release assets now contain one Linux binary, `rmtdos-utils`, plus the DOS-side
+`.com` programs.
 
 ## Project Lineage
 

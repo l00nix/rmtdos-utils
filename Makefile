@@ -54,9 +54,9 @@ FC_RENAMES := \
 	-Dfile_remote_copy=fc_file_remote_copy \
 	-Dremote_dir_fetch=fc_remote_dir_fetch
 
-.PHONY: all cga-web file-commander clean format
+.PHONY: all cga-web cga-web-dos file-commander legacy-linux clean format
 
-all: $(UTILS_BIN) cga-web file-commander
+all: $(UTILS_BIN) cga-web-dos
 
 $(OUTDIR) $(UNIFIED_BUILD):
 	mkdir -p $@
@@ -78,10 +78,14 @@ $(UNIFIED_BUILD)/fc/%.o: tools/file-commander/src/%.c | $(UNIFIED_BUILD)
 	$(CC) -std=c99 -Wall -Wextra -Wpedantic -g -Itools/file-commander/src \
 	      $(FC_RENAMES) $(shell $(PKG_CONFIG) ncursesw --cflags) -c -o $@ $<
 
-cga-web:
-	$(MAKE) -C tools/cga-web
+cga-web cga-web-dos:
+	$(MAKE) -C tools/cga-web dos
 
 file-commander:
+	$(MAKE) -C tools/file-commander
+
+legacy-linux:
+	$(MAKE) -C tools/cga-web client
 	$(MAKE) -C tools/file-commander
 
 clean:
