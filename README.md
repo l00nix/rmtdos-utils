@@ -61,6 +61,8 @@ sudo ./out/rmtdos-utils -i enp2s0
 
 The launcher probes the LAN once, lets you select a DOS host, then asks whether
 to open the remote shell or the file commander for that host.
+When the selected mode exits cleanly, `rmtdos-utils` returns to the host
+selector. Press `q`, `Esc`, or `Ctrl-]` from the selector to exit the launcher.
 
 Optional shell-mode CGA web view:
 

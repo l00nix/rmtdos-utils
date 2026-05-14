@@ -273,11 +273,6 @@ int main(int argc, char **argv) {
   uint16_t ethertype = ETHERTYPE_RMTDOS;
   int web_enabled = 0;
   int opt;
-  int rc = 1;
-  struct RawSocket sock = {0};
-  struct RemoteHost *host;
-  uint8_t host_addr[ETH_ALEN];
-  enum LaunchMode mode;
 
   while ((opt = getopt(argc, argv, "e:hi:vwW:")) != -1) {
     switch (opt) {
@@ -316,52 +311,55 @@ int main(int argc, char **argv) {
 
   setlocale(LC_ALL, "");
 
-  if (create_socket(&sock, if_name, ethertype) < 0) {
-    return 1;
-  }
-  hostlist_create();
+  while (1) {
+    struct RawSocket sock = {0};
+    struct RemoteHost *host;
+    uint8_t host_addr[ETH_ALEN];
+    enum LaunchMode mode;
+    int rc = 0;
 
-  initscr();
-  cbreak();
-  noecho();
-  keypad(stdscr, TRUE);
-  nodelay(stdscr, TRUE);
-  curs_set(0);
-  start_color();
-  use_default_colors();
-  init_pair(1, COLOR_BLACK, COLOR_CYAN);
-  init_pair(2, COLOR_CYAN, -1);
+    if (create_socket(&sock, if_name, ethertype) < 0) {
+      return 1;
+    }
+    hostlist_create();
 
-  host = select_host(&sock);
-  if (!host) {
-    rc = 0;
-    goto out_curses;
-  }
-  memcpy(host_addr, host->if_addr, sizeof(host_addr));
+    initscr();
+    cbreak();
+    noecho();
+    keypad(stdscr, TRUE);
+    nodelay(stdscr, TRUE);
+    curs_set(0);
+    start_color();
+    use_default_colors();
+    init_pair(1, COLOR_BLACK, COLOR_CYAN);
+    init_pair(2, COLOR_CYAN, -1);
 
-  mode = select_mode(host);
-  if (mode == LAUNCH_NONE) {
-    rc = 0;
-    goto out_curses;
-  }
+    host = select_host(&sock);
+    if (!host) {
+      endwin();
+      hostlist_destroy();
+      close_socket(&sock);
+      return 0;
+    }
+    memcpy(host_addr, host->if_addr, sizeof(host_addr));
 
-  endwin();
-  close_socket(&sock);
-  hostlist_destroy();
+    mode = select_mode(host);
+    endwin();
+    hostlist_destroy();
+    close_socket(&sock);
 
-  if (mode == LAUNCH_SHELL) {
-    return run_shell_mode(if_name, ethertype, host_addr, web_enabled,
+    if (mode == LAUNCH_NONE) {
+      return 0;
+    }
+    if (mode == LAUNCH_SHELL) {
+      rc = run_shell_mode(if_name, ethertype, host_addr, web_enabled,
                           web_listen);
-  }
-  if (mode == LAUNCH_FILE_COMMANDER) {
-    return run_file_commander_mode(if_name, ethertype, host_addr);
-  }
+    } else if (mode == LAUNCH_FILE_COMMANDER) {
+      rc = run_file_commander_mode(if_name, ethertype, host_addr);
+    }
 
-  return 0;
-
-out_curses:
-  endwin();
-  hostlist_destroy();
-  close_socket(&sock);
-  return rc;
+    if (rc) {
+      return rc;
+    }
+  }
 }
